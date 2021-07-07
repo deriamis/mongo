@@ -5,6 +5,7 @@ import copy
 import datetime
 import errno
 import json
+import logging
 import os
 import re
 import shlex
@@ -50,6 +51,18 @@ scons_invocation = '{} {}'.format(sys.executable, ' '.join(sys.argv))
 print('scons: running with args {}'.format(scons_invocation))
 
 atexit.register(mongo.print_build_failures)
+
+
+class LogLevelFilter(logging.Filter):
+    """Filters log entries by log level."""
+
+    def __init__(self, max_level):
+        self._max_level = max_level
+
+    def filter(self, record: logging.LogRecord):
+        """Return whether the log record should be passed through."""
+        return record.levelno <= self._max_level
+
 
 def add_option(name, **kwargs):
 
@@ -645,12 +658,100 @@ add_option('visibility-support',
     type='choice',
 )
 
+# Set up paths
+
+# If the user isn't using the # to indicate top-of-tree or $ to expand a variable, forbid
+# relative paths. Relative paths don't really work as expected, because they end up relative to
+# the top level SConstruct, not the invokers CWD. We could in theory fix this with
+# GetLaunchDir, but that seems a step too far.
+buildDir = get_option('build-dir').rstrip('/')
+if buildDir[0] not in ['$', '#']:
+    if not os.path.isabs(buildDir):
+        print("Do not use relative paths with --build-dir")
+        Exit(1)
+
+cacheDir = get_option('cache-dir').rstrip('/')
+if cacheDir[0] not in ['$', '#']:
+    if not os.path.isabs(cacheDir):
+        print("Do not use relative paths with --cache-dir")
+        Exit(1)
+
+sconsDataDir = Dir(buildDir).Dir('scons')
+SConsignFile(str(sconsDataDir.File('sconsign.py3')))
+
+
+# Set up logging
+
+log = logging.getLogger()
+log.setLevel(logging.DEBUG)
+
+log_stdout_handler = logging.StreamHandler(sys.stdout)
+log_stdout_handler.setLevel(logging.INFO)
+log_stdout_handler.addFilter(LogLevelFilter(logging.INFO))
+log.addHandler(log_stdout_handler)
+
+log_stderr_handler = logging.StreamHandler(sys.stderr)
+log_stderr_handler.setLevel(logging.WARNING)
+log.addHandler(log_stderr_handler)
+
+log_file_handler = logging.FileHandler(str(sconsDataDir) + '/build.log')
+log_file_handler.setLevel(logging.DEBUG)
+log_file_formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+log_file_handler.setFormatter(log_file_formatter)
+log.addHandler(log_file_handler)
+
+def print_cmd_line(s, targets, sources, env):
+    if not any("conftest" in str(target) for target in targets):
+        if env.get('VERBOSE', False):
+            log.info(s)
+        else:
+            log.debug(s)
+            if targets is None or len(targets) == 0:
+                log.info('Reading %s ...', ' and '.join([str(source) for source in sources]))
+            elif sources is None or len(sources) == 0:
+                log.info('Writing %s ...', ' and '.join([str(target) for target in targets]))
+            else:
+                log.info('Building %s -> %s ...',
+                    ' and '.join([str(source) for source in sources]),
+                    ' and '.join([str(target) for target in targets]))
+
+def logged_spawn(sh, escape, cmd, args, env):
+    if not env.get('VERBOSE', False):
+        log.debug('Executing: %s', ' '.join(args))
+
+    process = subprocess.Popen(
+        ' '.join(args),
+        env=env,
+        close_fds=True,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE)
+
+    stdout, stderr = process.communicate()
+    rc = process.wait()
+
+    if stdout is not None and len(stdout):
+        if env.get('VERBOSE', False):
+            log.info(stdout)
+        else:
+            log.debug(stdout.decode(sys.stdout.encoding))
+    if stderr is not None and len(stderr):
+        log.error(stderr.decode(sys.stderr.encoding))
+
+    if process.stdout:
+        process.stdout.close()
+    if process.stderr:
+        process.stderr.close()
+
+    return rc
+
+
 try:
     with open("version.json", "r") as version_fp:
         version_data = json.load(version_fp)
 
     if 'version' not in version_data:
-        print("version.json does not contain a version string")
+        log.error("version.json does not contain a version string")
         Exit(1)
     if 'githash' not in version_data:
         version_data['githash'] = utils.get_git_version()
@@ -658,7 +759,7 @@ try:
 except IOError as e:
     # If the file error wasn't because the file is missing, error out
     if e.errno != errno.ENOENT:
-        print(("Error opening version.json: {0}".format(e.strerror)))
+        log.error("Error opening version.json: %s", e.strerror)
         Exit(1)
 
     version_data = {
@@ -667,7 +768,7 @@ except IOError as e:
     }
 
 except ValueError as e:
-    print(("Error decoding version.json: {0}".format(e)))
+    log.error("Error decoding version.json: %s", e)
     Exit(1)
 
 # Setup the command-line variables
@@ -742,7 +843,7 @@ def variable_distsrc_converter(val):
     return val
 
 def fatal_error(env, msg, *args):
-    print(msg.format(*args))
+    log.error(msg, *args)
     Exit(1)
 
 # Apply the default variables files, and walk the provided
@@ -759,8 +860,8 @@ for variables_file in variables_files_args:
         variables_files = []
 for vf in variables_files:
     if not os.path.isfile(vf):
-        fatal_error(None, f"Specified variables file '{vf}' does not exist")
-    print(f"Using variable customization file {vf}")
+        fatal_error(None, "Specified variables file '%s' does not exist", vf)
+    log.info("Using variable customization file %s", vf)
 
 env_vars = Variables(
     files=variables_files,
@@ -769,7 +870,7 @@ env_vars = Variables(
 
 sconsflags = os.environ.get('SCONSFLAGS', None)
 if sconsflags:
-    print(("Using SCONSFLAGS environment variable arguments: %s" % sconsflags))
+    log.info("Using SCONSFLAGS environment variable arguments: %s", sconsflags)
 
 env_vars.Add('ABIDW',
     help="Configures the path to the 'abidw' (a libabigail) utility")
@@ -942,7 +1043,7 @@ env_vars.Add('MONGO_DISTNAME',
 def validate_mongo_version(key, val, env):
     regex = r'^(\d+)\.(\d+)\.(\d+)-?((?:(rc)(\d+))?.*)?'
     if not re.match(regex, val):
-        print(("Invalid MONGO_VERSION '{}', or could not derive from version.json or git metadata. Please add a conforming MONGO_VERSION=x.y.z[-extra] as an argument to SCons".format(val)))
+        log.error("Invalid MONGO_VERSION '%s', or could not derive from version.json or git metadata. Please add a conforming MONGO_VERSION=x.y.z[-extra] as an argument to SCons", val)
         Exit(1)
 
 env_vars.Add('MONGO_VERSION',
@@ -1104,34 +1205,15 @@ if GetOption('help'):
     Return()
 
 if ('CC' in variables_only_env) != ('CXX' in variables_only_env):
-    print('Cannot customize C compiler without customizing C++ compiler, and vice versa')
+    log.error('Cannot customize C compiler without customizing C++ compiler, and vice versa')
     Exit(1)
 
 # --- environment setup ---
 
-# If the user isn't using the # to indicate top-of-tree or $ to expand a variable, forbid
-# relative paths. Relative paths don't really work as expected, because they end up relative to
-# the top level SConstruct, not the invokers CWD. We could in theory fix this with
-# GetLaunchDir, but that seems a step too far.
-buildDir = get_option('build-dir').rstrip('/')
-if buildDir[0] not in ['$', '#']:
-    if not os.path.isabs(buildDir):
-        print("Do not use relative paths with --build-dir")
-        Exit(1)
-
-cacheDir = get_option('cache-dir').rstrip('/')
-if cacheDir[0] not in ['$', '#']:
-    if not os.path.isabs(cacheDir):
-        print("Do not use relative paths with --cache-dir")
-        Exit(1)
-
-sconsDataDir = Dir(buildDir).Dir('scons')
-SConsignFile(str(sconsDataDir.File('sconsign.py3')))
-
 def printLocalInfo():
     import sys, SCons
-    print(( "scons version: " + SCons.__version__ ))
-    print(( "python version: " + " ".join( [ repr(i) for i in sys.version_info ] ) ))
+    log.info("scons version: %s", SCons.__version__)
+    log.info("python version: %s", " ".join( [ repr(i) for i in sys.version_info ] ))
 
 printLocalInfo()
 
@@ -1156,7 +1238,7 @@ debugBuild, optBuild = dbg_opt_mapping[(get_option('dbg'), get_option('opt'))]
 optBuildForSize = True if optBuild and get_option('opt') == "size" else False
 
 if releaseBuild and (debugBuild or not optBuild):
-    print("Error: A --release build may not have debugging, and must have optimization")
+    log.error("Error: A --release build may not have debugging, and must have optimization")
     Exit(1)
 
 noshell = has_option( "noshell" )
@@ -1168,7 +1250,7 @@ serverJs = get_option( "server-js" ) == "on"
 usemozjs = (jsEngine.startswith('mozjs'))
 
 if not serverJs and not usemozjs:
-    print("Warning: --server-js=off is not needed with --js-engine=none")
+    log.warning("Warning: --server-js=off is not needed with --js-engine=none")
 
 # We defer building the env until we have determined whether we want certain values. Some values
 # in the env actually have semantics for 'None' that differ from being absent, so it is better
@@ -1213,6 +1295,14 @@ if get_option('build-tools') == 'next':
 env = Environment(variables=env_vars, **envDict)
 del envDict
 
+# Set up command line printing
+env['PRINT_CMD_LINE_FUNC'] = print_cmd_line
+
+# Set up command output redirection
+env['_LOGGED_SPAWN'] = logged_spawn
+env['_SPAWN_ORIG'] = env['SPAWN']
+env['SPAWN'] = logged_spawn
+
 if get_option('cache-signature-mode') == 'validate':
     validate_cache_dir = Tool('validate_cache_dir')
     if validate_cache_dir.exists(env):
@@ -1255,18 +1345,18 @@ for var in ['CC', 'CXX']:
     if var not in env:
         continue
     path = env[var]
-    print('{} is {}'.format(var, path))
+    log.info('%s is %s', var, path)
     if not os.path.isabs(path):
         which = shutil.which(path)
         if which is None:
-            print('{} was not found in $PATH'.format(path))
+            log.error('%s was not found in $PATH', path)
         else:
-            print('{} found in $PATH at {}'.format(path, which))
+            log.info('%s found in $PATH at %s', path, which)
             path = which
 
     realpath = os.path.realpath(path)
     if realpath != path:
-        print('{} resolves to {}'.format(path, realpath))
+        log.info('%s resolves to %s', path, realpath)
 
 env.AddMethod(mongo_platform.env_os_is_wrapper, 'TargetOSIs')
 env.AddMethod(mongo_platform.env_get_os_name_wrapper, 'GetTargetOSName')
@@ -1291,8 +1381,8 @@ env.AddMethod(shim_library, 'ShimLibrary')
 
 
 def conf_error(env, msg, *args):
-    print(msg.format(*args))
-    print("See {0} for details".format(env.File('$CONFIGURELOG').abspath))
+    log.error(msg, *args)
+    log.error("See %s for details", env.File('$CONFIGURELOG').abspath)
     Exit(1)
 
 env.AddMethod(fatal_error, 'FatalError')
@@ -1310,7 +1400,7 @@ def to_boolean(s):
 # Normalize the VERBOSE Option, and make its value available as a
 # function.
 if env['VERBOSE'] == "auto":
-    env['VERBOSE'] = not sys.stdout.isatty()
+    env['VERBOSE'] = sys.stdout.isatty()
 else:
     try:
         env['VERBOSE'] = to_boolean(env['VERBOSE'])
@@ -1325,7 +1415,7 @@ except ValueError as e:
     env.FatalError("Error setting ICECC_DEBUG variable: {e}")
 
 if has_option('variables-help'):
-    print(env_vars.GenerateHelpText(env))
+    log.info(env_vars.GenerateHelpText(env))
     Exit(0)
 
 unknown_vars = env_vars.UnknownVariables()
@@ -1525,7 +1615,7 @@ else:
     env['TARGET_ARCH'] = detected_processor
 
 if env['TARGET_OS'] not in os_macros:
-    print("No special config for [{0}] which probably means it won't work".format(env['TARGET_OS']))
+    log.info("No special config for [%s] which probably means it won't work", env['TARGET_OS'])
 elif not detectSystem.CheckForOS(env['TARGET_OS']):
     env.ConfError("TARGET_OS ({0}) is not supported by compiler", env['TARGET_OS'])
 
@@ -1613,7 +1703,7 @@ elif use_libunwind == "auto":
 
 use_vendored_libunwind = use_libunwind and not use_system_libunwind
 if use_system_libunwind and not use_libunwind:
-    print("Error: --use-system-libunwind requires --use-libunwind")
+    log.error("Error: --use-system-libunwind requires --use-libunwind")
     Exit(1)
 if use_libunwind == True:
     env.SetConfigHeaderDefine("MONGO_CONFIG_USE_LIBUNWIND")
@@ -1742,7 +1832,7 @@ if link_model.startswith("dynamic"):
 
     if env.TargetOSIs('darwin'):
         if link_model.startswith('dynamic'):
-            print("WARNING: Building MongoDB server with dynamic linking " +
+            log.error("WARNING: Building MongoDB server with dynamic linking " +
                   "on macOS is not supported. Static linking is recommended.")
 
         if link_model == "dynamic-strict":
@@ -2243,7 +2333,7 @@ elif env.TargetOSIs('windows'):
         if os.path.exists(os.path.join(pathdir, 'cl.exe')):
             break
     else:
-        print("NOTE: Tool configuration did not find 'cl' compiler, falling back to os environment")
+        log.info("NOTE: Tool configuration did not find 'cl' compiler, falling back to os environment")
         env['ENV'] = dict(os.environ)
 
     env.Append(CPPDEFINES=[
@@ -2839,8 +2929,8 @@ def doConfigure(myenv):
     if not (c_compiler_validated and cxx_compiler_validated):
         if not suppress_invalid:
             env.ConfError("ERROR: Refusing to build with compiler that does not meet requirements")
-        print("WARNING: Ignoring failed compiler version check per explicit user request.")
-        print("WARNING: The build may fail, binaries may crash, or may run but corrupt data...")
+        log.warning("WARNING: Ignoring failed compiler version check per explicit user request.")
+        log.warning("WARNING: The build may fail, binaries may crash, or may run but corrupt data...")
 
     # Figure out what our minimum windows version is. If the user has specified, then use
     # that.
@@ -3020,17 +3110,17 @@ def doConfigure(myenv):
 
     if not detectCompiler.CheckCC():
         env.ConfError(
-            "C compiler {0} doesn't work",
+            "C compiler %s doesn't work",
             detectEnv['CC'])
 
     if not detectCompiler.CheckCXX():
         env.ConfError(
-            "C++ compiler {0} doesn't work",
+            "C++ compiler %s doesn't work",
             detectEnv['CXX'])
 
     if not detectCompiler.CheckForCXXLink():
         env.ConfError(
-            "C++ compiler {0} can't link C++ programs",
+            "C++ compiler %s can't link C++ programs",
             detectEnv['CXX'])
 
     detectCompiler.Finish()
@@ -3276,7 +3366,7 @@ def doConfigure(myenv):
             myenv.ConfError("C++17 mode selected for C++ files, but can't enable C11 for C files")
 
     if using_system_version_of_cxx_libraries():
-        print( 'WARNING: System versions of C++ libraries must be compiled with C++17 support' )
+        log.warning( 'WARNING: System versions of C++ libraries must be compiled with C++17 support' )
 
     def CheckCxx17(context):
         test_body = """
@@ -3532,7 +3622,7 @@ def doConfigure(myenv):
             myenv.Append(LINKFLAGS=[sanitizer_option])
             myenv.Append(CCFLAGS=['-fno-omit-frame-pointer'])
         else:
-            myenv.ConfError('Failed to enable sanitizers with flag: {0}', sanitizer_option )
+            myenv.ConfError('Failed to enable sanitizers with flag: %s', sanitizer_option )
 
         myenv['SANITIZERS_ENABLED'] = sanitizer_list
 
@@ -3542,7 +3632,7 @@ def doConfigure(myenv):
             if AddToCCFLAGSIfSupported(myenv,sanitize_coverage_option):
                 myenv.Append(LINKFLAGS=[sanitize_coverage_option])
             else:
-                myenv.ConfError('Failed to enable -fsanitize-coverage with flag: {0}', sanitize_coverage_option )
+                myenv.ConfError('Failed to enable -fsanitize-coverage with flag: %s', sanitize_coverage_option )
 
 
         denyfiles_map = {
@@ -3973,7 +4063,7 @@ def doConfigure(myenv):
                     \tscons CPPPATH=/usr/local/opt/openssl/include LIBPATH=/usr/local/opt/openssl/lib ...
                     NOTE: Consult the output of 'brew info openssl' for details on the correct paths."""
                 )
-                print(advice)
+                log.info(advice)
                 brew = env.WhereIs('brew')
                 if brew:
                     try:
@@ -3983,11 +4073,11 @@ def doConfigure(myenv):
                         message = subprocess.check_output([brew, "info", "openssl"]).decode('utf-8')
                         advice = textwrap.dedent(
                             """\
-                            NOTE: HomeBrew installed to {0} appears to have OpenSSL installed.
-                            NOTE: Consult the output from '{0} info openssl' to determine CPPPATH and LIBPATH."""
-                        ).format(brew, message)
+                            NOTE: HomeBrew installed to %s appears to have OpenSSL installed.
+                            NOTE: Consult the output from '%s info openssl' to determine CPPPATH and LIBPATH."""
+                        )
 
-                        print(advice)
+                        log.info(advice, brew, message)
                     except:
                         pass
 
@@ -4139,7 +4229,7 @@ def doConfigure(myenv):
         # Either crypto engine is native,
         # or it's OpenSSL and has been checked to be working.
         conf.env.SetConfigHeaderDefine("MONGO_CONFIG_SSL")
-        print("Using SSL Provider: {0}".format(ssl_provider))
+        log.info("Using SSL Provider: %s", ssl_provider)
     else:
         ssl_provider = "none"
 
@@ -4449,7 +4539,7 @@ def doConfigure(myenv):
         if checkHTTPLib():
             http_client = "on"
         else:
-            print("Disabling http-client as libcurl was not found")
+            log.info("Disabling http-client as libcurl was not found")
             http_client = "off"
     elif http_client == "on":
         checkHTTPLib(required=True)
@@ -4544,7 +4634,6 @@ def doConfigure(myenv):
 env = doConfigure( env )
 env["NINJA_SYNTAX"] = "#site_scons/third_party/ninja_syntax.py"
 
-
 if env.ToolchainIs("clang"):
     env["ICECC_COMPILER_TYPE"] = "clang"
 elif env.ToolchainIs("gcc"):
@@ -4622,7 +4711,7 @@ if (get_option('ninja') != "disabled"
     and ('ICECC' not in env or not env['ICECC'])
     and not has_option('force-jobs')):
 
-    print(f"WARNING: Icecream not enabled - Ninja concurrency will be capped at {cpu_count} jobs " +
+    log.warning(f"WARNING: Icecream not enabled - Ninja concurrency will be capped at {cpu_count} jobs " +
         "without regard to the -j value passed to it. " +
         "Generate your ninja file with --force-jobs to disable this behavior.")
     env['NINJA_MAX_JOBS'] = cpu_count
@@ -5321,7 +5410,7 @@ if has_option('jlink'):
         jlink = env.GetOption('num_jobs') * jlink
         jlink = round(jlink)
         if jlink < 1.0:
-            print("Computed jlink value was less than 1; Defaulting to 1")
+            log.info("Computed jlink value was less than 1; Defaulting to 1")
             jlink = 1.0
 
     jlink = int(jlink)

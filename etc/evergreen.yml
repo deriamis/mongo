@@ -2036,6 +2036,18 @@ functions:
         permissions: public-read
         display_name: SCons cache debug log
 
+    - command: s3.put
+      params:
+        optional: true
+        aws_key: ${aws_key}
+        aws_secret: ${aws_secret}
+        local_file: src/build/scons/build.log
+        remote_file: ${project}/${build_variant}/${revision}/artifacts/scons-build.log.${build_id}-${task_name}-${execution}
+        bucket: mciuploads
+        permissions: public-read
+        content_type: text/plain
+        display_name: SCons build log
+
     - *f_expansions_write
     - command: subprocess.exec
       params:
